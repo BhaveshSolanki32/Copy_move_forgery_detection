@@ -1,448 +1,407 @@
-# SciForge: Copy-Move Forgery Detection in Scientific Images
+# 🧠 Intracranial Aneurysm Detection — RSNA Kaggle Competition
 
-> **Instance-level copy-move forgery segmentation in biomedical research images using contrastive pixel embeddings, dual-encoder feature fusion, and SAM3-powered synthetic data generation.**
+[![Kaggle Competition](https://img.shields.io/badge/Kaggle-RSNA%20Aneurysm%20Detection-blue?logo=kaggle)](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.6-orange?logo=pytorch)](https://pytorch.org/)
+[![MONAI](https://img.shields.io/badge/MONAI-Medical%20AI-green)](https://monai.io/)
+
+> End-to-end deep learning pipeline for detecting and localizing intracranial aneurysms across **four imaging modalities** (CTA, MRA, MRI T1post, MRI T2). Two-stage architecture: a **patch-level Hybrid SwinUNETR classifier** trains on 96³ voxel patches, then a separate **scan-level Hierarchical Transformer** aggregates per-patch embeddings to make a final whole-scan prediction.
 
 ---
 
 ## Table of Contents
 
-- [Project Overview](#project-overview)
-- [The Problem: Why Copy-Move Forgery is Hard](#the-problem-why-copy-move-forgery-is-hard)
-- [Dataset & EDA](#dataset--eda)
-- [Synthetic Data Generation Pipeline](#synthetic-data-generation-pipeline)
-- [Model Architectures](#model-architectures)
-  - [Model 1 — Hybrid Stem Swin+UNet with Contrastive Learning](#model-1--hybrid-stem-swinunet-with-contrastive-learning)
-  - [Model 2 — Dual-Encoder Swin + ConvNeXt Fusion](#model-2--dual-encoder-swin--convnext-fusion)
-  - [Model 3 — DINOv2 + MLP + HDBSCAN Clustering](#model-3--dinov2--mlp--hdbscan-clustering)
-- [Loss Functions](#loss-functions)
-- [Training Infrastructure](#training-infrastructure)
+- [Background & Competition](#background--competition)
+- [Project Journey](#project-journey)
+- [Dataset & Modalities](#dataset--modalities)
+- [Pipeline Overview](#pipeline-overview)
+- [Preprocessing](#preprocessing)
+- [3D Patch Strategy](#3d-patch-strategy)
+- [Model Architecture](#model-architecture)
+  - [Phase 1 — Patch-Level Hybrid Classifier](#phase-1--patch-level-hybrid-classifier)
+  - [Phase 2 — Embedding Extraction](#phase-2--embedding-extraction)
+  - [Phase 3 — Scan-Level Hierarchical Transformer](#phase-3--scan-level-hierarchical-transformer)
+- [Loss Function](#loss-function)
+- [Training Strategy](#training-strategy)
 - [Results](#results)
 - [Repository Structure](#repository-structure)
 - [Setup & Usage](#setup--usage)
-- [Key Takeaways](#key-takeaways)
+- [Technologies Used](#technologies-used)
 
 ---
 
-## Project Overview
+## Background & Competition
 
-**Team:** 3 members &nbsp;|&nbsp; **Duration:** ~1 month &nbsp;|&nbsp; **Hardware:** 2× NVIDIA T4 GPUs
+The [RSNA Intracranial Aneurysm Detection](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection) competition challenged participants to automatically detect and localize intracranial aneurysms — balloon-like bulges in cerebral blood vessels — from medical brain scans. Undetected aneurysms can rupture, causing life-threatening hemorrhagic stroke.
 
-This project tackles **instance-level copy-move image forgery detection** in biomedical research images — a task where a region of a scientific image (e.g., a microscopy slide or gel blot) is copied, possibly transformed, and pasted back onto the same image to misrepresent experimental results. The goal is to predict binary pixel-level segmentation masks identifying every forged region, evaluated using the **Object F1 (OF1)** metric — which uses the Hungarian algorithm to optimally match predicted masks to ground truth instances.
-
-The project involved three major components built over the course of a month:
-
-1. **EDA** of the original dataset (image size distributions, DPI, forgery area coverage, instance counts)
-2. **Synthetic data generation** at scale using SAM3 to combat data scarcity
-3. **Three successive model architectures**, each addressing limitations discovered in the previous iteration
+The task required:
+- **Binary detection**: Is an aneurysm present in this scan?
+- **Multi-label localization**: Which of 13 arterial locations is the aneurysm at? (e.g., Left MCA, Basilar Tip, Anterior Communicating Artery, etc.)
+- Handling a **heavily imbalanced dataset** across heterogeneous imaging modalities and scanner manufacturers.
 
 ---
 
-## The Problem: Why Copy-Move Forgery is Hard
+## Project Journey
 
-Most image forgery detection literature focuses on splicing (pasting from a different image). Copy-move forgery within scientific images is fundamentally harder for two reasons:
+This competition was an intensive deep dive into 3D medical imaging. The focus was deliberately on understanding the data before modeling.
 
-**1. The dual-region problem:** The model must not only find *where* the forged region is (the destination), but also implicitly reason about *where it came from* (the source region in the same image). These two regions look identical — because one is literally a copy of the other. A model that learns only "what looks weird" will miss source regions entirely.
+**Month 1 — Deep Data Exploration.** The dataset contained four imaging modalities — CTA, MRA, MRI T1post, MRI T2 — each with fundamentally different acquisition physics and visual characteristics. Before writing any model code, significant time was spent understanding what each modality looks like, how Hounsfield units behave in CT versus signal intensities in MRI, and how aneurysms manifest differently across scan types.
 
-**2. Background homogeneity:** Scientific images (microscopy, gel electrophoresis, western blots) contain large areas of repetitive textures. A patch from the background looks nearly identical to a neighboring background patch. This causes naive patch-matching or texture-anomaly approaches to produce massive numbers of false positives. The true signal — *this exact patch appears in two distinct spatial locations* — is subtle and requires learning dense, discriminative patch embeddings rather than pixel-level texture features.
+A key insight came from the scanner metadata: even within a single modality, scans from different manufacturers had vastly different intensity distributions, slice spacings, and resolutions. This drove an extended investigation into clustering and normalization strategies before converging on a robust approach.
 
-This insight drove all three model architectures: the core idea was to make the embedding space such that **pixels within a forged instance cluster together** and are **pushed away from the background cluster**, enabling the model to find duplicate regions by searching for anomalously similar embeddings in distant spatial locations.
+**Preprocessing Design.** Separate pipelines were designed for CT-based (CTA) and MRI-based (MRA, T1post, T2) scans, each handling the specific physics and artifacts of that modality. Particular care went into the coordinate transformation logic — correctly mapping a radiologist's 2D DICOM pixel annotation into the 3D resampled voxel space, including handling multiframe DICOMs and `PerFrameFunctionalGroupsSequence` edge cases.
 
----
-
-## Dataset & EDA
-
-The original dataset contains **5,128 RGB biomedical images** from multiple scientific imaging modalities:
-
-| Split | Authentic | Forged |
-|---|---|---|
-| Train | ~1,500 | ~3,600 |
-| Supplemental HQ | 48 | 48 |
-
-**EDA findings (performed by teammates):**
-
-- Image resolutions varied widely (not square, not fixed DPI) — required letterbox resizing to preserve aspect ratio
-- Forgery area coverage: median ~8% of total image area, highly skewed — most forgeries are small
-- Instance count distribution: 1 instance dominates (~55%), with a long tail up to 6
-- DPI distributions differed across imaging modalities (blot vs. microscopy vs. fluorescence)
-
-<!-- INSERT: EDA graphs — image size distribution, forgery area histogram, instance count bar chart -->
-
-These findings informed several design choices: letterbox padding instead of stretch resizing, focal loss to handle extreme foreground-background imbalance, and capping maximum instances at 6.
+**Modeling.** The scale mismatch between aneurysms (millimeter-sized) and full brain scans (large 3D volumes) drove a two-stage design: a patch-level model learning local features, and a scan-level model that reasons globally across all patches.
 
 ---
 
-## Synthetic Data Generation Pipeline
+## Dataset & Modalities
 
-The original dataset's ~3,600 forged training images were insufficient for training deep segmentation models. We built a custom synthetic data generator using **Meta's SAM3 (Segment Anything Model 3)** that programmatically creates copy-move forgeries with ground-truth masks.
+| Modality | Description | Key Challenge |
+|----------|-------------|---------------|
+| **CTA** | CT Angiography — high-res vascular contrast | HU windowing, bone/vessel separation |
+| **MRA** | MR Angiography — vascular-sensitive MRI | Variable intensity, manufacturer differences |
+| **MRI T1post** | Post-contrast T1-weighted MRI | Lower vascular contrast than CTA |
+| **MRI T2** | T2-weighted MRI | Fluid-bright, different tissue contrast |
 
-### Pipeline Architecture
-
-```
-Input Image (COCO / Scientific)
-        │
-        ▼
-  SAM3 Segmentation
-  (Text-prompted: "object", "animal", "human", "thing")
-        │
-        ▼
-  Candidate Patch Selection
-  (CONFIDENCE > 0.4, 1–8 candidates)
-        │
-        ▼
-  Copy-Move Augmentation
-  ├── Random rotation: U(-180°, +180°)
-  ├── Random scale: U(0.8, 1.2)
-  └── Overlap rejection: IoU < 0.05
-        │
-        ▼
-  RLE Mask Encoding & Save
-  (Fortran-order, JSON-serialized, semicolon-separated per instance)
-```
-
-### Two Generated Datasets
-
-| Dataset | Source | Forged Images | Notes |
-|---|---|---|---|
-| `synthetic_forgery_dataset` | Scientific domain images | ~11,000 | Same image modality as test set |
-| `coco_forgery_dataset` | COCO 2017 (80k natural images) | ~84,700 | Scale diversity, generalizable features |
-
-**Instance distribution (per image):**
-
-```
-1 instance: 30%   2 instances: 25%   3 instances: 20%
-4 instances: 12%  5 instances: 8%    6 instances: 5%
-```
-
-**Copy count distribution per object:**
-```
-1 copy: 65%   2 copies: 25%   3 copies: 8%   4 copies: 2%
-```
-
-DDP was used across both GPUs during generation to parallelize SAM3 inference, enabling generation of the full 84.7k COCO dataset in a single session.
-
-<!-- INSERT: Sample synthetic images — original / forged / mask overlay -->
-
-### Mask Format
-
-Masks are stored as RLE-encoded `.npy` files. Each file contains a semicolon-separated string of JSON-encoded `[start, length, start, length, ...]` run-length pairs (1-based indexing, Fortran column-major order — matching the competition ground truth format). A `rle_convert.py` utility converts these to raw `(N, H, W)` NumPy arrays for model consumption.
+Each positive scan includes 2D pixel coordinates on a specific DICOM slice and a location label from 13 possible arterial sites. The dataset is heavily imbalanced — the vast majority of 96³ patches contain no aneurysm.
 
 ---
 
-## Model Architectures
+## Pipeline Overview
 
-All three models share the same high-level philosophy: **learn discriminative dense embeddings that cluster by semantic identity**, then decode those embeddings into instance masks. The key insight is that copy-move forgeries produce regions with matching embeddings separated in space — a signature that pixel-level or purely local features cannot capture.
+```
+Raw DICOM Scans (CTA / MRA / MRI T1post / MRI T2)
+         │
+         ▼
+┌──────────────────────────────────────┐
+│   Modality-Specific Preprocessing    │
+│   • DICOM series → 3D numpy volume   │
+│   • Isotropic resampling             │
+│   • Intensity normalization          │
+│   • 2D annotation → 3D voxel coords  │
+└─────────────────┬────────────────────┘
+                  │
+                  ▼
+     HDF5 Storage (float16, gzip, chunked)
+                  │
+                  ▼
+┌──────────────────────────────────────┐
+│   3D Sliding Window Patching         │
+│   96×96×96 patches, stride 64        │
+│   → train/test manifest CSVs         │
+│     (319,550 total patches)          │
+└─────────────────┬────────────────────┘
+                  │
+                  ▼
+┌──────────────────────────────────────┐
+│  Phase 1: Patch-Level Training       │   training-aneurysm-kaggle.ipynb
+│  HybridAneurysmClassifier            │
+│  • Modality-specific CNN stems       │
+│  • Shared SwinUNETR transformer body │
+│  • Dual output heads:                │
+│    ├── Aneurysm Present (binary)     │
+│    └── Artery Location (13-class)    │
+└─────────────────┬────────────────────┘
+                  │  best checkpoint saved
+                  ▼
+┌──────────────────────────────────────┐
+│  Phase 2: Embedding Extraction       │   model-data-collection-patch.ipynb
+│  HybridAneurysmEmbedder              │
+│  • Same stems + SwinUNETR body       │
+│  • No classification heads           │
+│  • Returns 768-dim pooled embedding  │
+│    per patch → extracted_embeddings  │
+└─────────────────┬────────────────────┘
+                  │  768-dim embeddings for all patches
+                  ▼
+┌──────────────────────────────────────┐
+│  Phase 3: Scan-Level Training        │   scan-level-model-rsna.ipynb
+│  HierarchicalTransformer             │
+│  • Local Transformer (patches→block) │
+│  • Global Transformer (blocks→scan)  │
+│  • Final scan-level prediction       │
+└──────────────────────────────────────┘
+```
 
 ---
 
-### Model 1 — Hybrid Stem Swin+UNet with Contrastive Learning
+## Preprocessing
 
-**File:** `sci-forge-b.ipynb`
+### CTA Pipeline (`preprocess_ct.py`)
 
-#### Architecture
+- Reads DICOM series via SimpleITK, handles single-frame and multiframe formats
+- Resamples to isotropic voxel spacing using B-spline interpolation
+- Applies HU windowing for the vascular/brain window
+- Maps 2D DICOM pixel annotations to 3D physical coordinates using `ImagePositionPatient` and `ImageOrientationPatient` DICOM tags
 
-```
-Input (3, 896, 896)
-     │
-     ▼
-ConvolutionalStem
- Block1: Conv(3→64, s=2) + Conv(64→64) → (64, 448, 448)
- Block2: Conv(64→128, s=2) + Conv(128→128) → (128, 224, 224)
-     │
-     ▼
-Swin-Small Encoder (swin_small_patch4_window7_224)
-  └── 4 stage outputs: (96,56), (192,28), (384,14), (768,7)
-     │
-     ▼
-UNet Decoder (ConvTranspose2d + skip connections)
-  Channels: 512 → 256 → 128 → 64 → 32
-     │
-     ├──▶ Segmentation Head → (NUM_INSTANCES, 224, 224) mask logits
-     ├──▶ Active Channel Head → (NUM_INSTANCES,) — is instance active?
-     └──▶ ContrastiveEmbeddingHead → (128, 224, 224) L2-normalized embeddings
-```
+### MRA / MRI Pipeline (`prep_mr.py`)
 
-**Key design decisions:**
+- Handles diversity of MRI protocols and scanner manufacturers
+- Modality-aware intensity normalization (rather than HU windowing)
+- Resolves the frame number `f` embedded inside annotation `coords_xy` dictionaries for multiframe MRI DICOMs
+- Uses `PerFrameFunctionalGroupsSequence` to correctly locate the annotated frame in multiframe acquisitions
+- Peak-finding heuristics via `scipy.signal.find_peaks` to identify the correct slice from manufacturer-provided frame indices
 
-- **ConvolutionalStem:** Swin's patch embedding discards fine-grained texture. The CNN stem first processes the 896px input at full resolution through two strided convolution blocks before handing 224px feature maps to Swin, preserving edge and boundary information that matters for tight mask boundaries.
-- **Contrastive embedding head:** Alongside the segmentation head, a separate branch produces 128-dim L2-normalized embeddings per spatial location. These are trained with a margin-based contrastive loss so that forged-instance pixels embed closer to each other and farther from the background.
-- **Active channel prediction:** Since instances can vary from 0–6, a binary classification head predicts which of the 6 output channels actually contains a forgery, reducing false positive masks.
+### Storage
 
-#### Training Config
+All processed scans stored in a single HDF5 file:
+- `float16` precision to halve storage size
+- Chunked `(32, 32, 32)` for efficient random patch reads during training
+- GZIP compression
+- File-lock mechanism (`*.lock` via `os.O_CREAT | os.O_EXCL`) for safe concurrent multi-process writes
+
+---
+
+## 3D Patch Strategy
 
 | Parameter | Value |
-|---|---|
-| Input size | 896 × 896 |
-| Mask output size | 224 × 224 |
-| Max instances | 6 |
-| Epochs | 45 |
-| Batch size | 26 (w/ grad accumulation ×10) |
-| Optimizer | AdamW (lr=4e-4, wd=1e-4) |
-| Scheduler | CosineAnnealing (η_min=1e-6) |
-| Mixed precision | ✅ AMP |
-| Encoder freeze | First 1 epoch |
+|-----------|-------|
+| Patch size | 96 × 96 × 96 voxels |
+| Stride | 64 voxels |
+| Total patches (train + test) | 319,550 |
+| Label assignment | Aneurysm present if coordinate falls inside patch bounds |
+| Artery labels | Bitwise OR across all aneurysms within patch |
+| Train / Test split | 80% / 20% at the scan (patient) level |
 
-<!-- INSERT: Model 1 training curves — loss components, OF1 vs epoch, LR schedule -->
+Patches are not stored on disk. **Manifest CSVs** record `(series_uid, start_z, start_y, start_x)` per patch and patches are extracted on-the-fly from HDF5 at training time.
 
 ---
 
-### Model 2 — Dual-Encoder Swin + ConvNeXt Fusion
+## Model Architecture
 
-**File:** `sci-forge-b-tri.ipynb`
+### Phase 1 — Patch-Level Hybrid Classifier
 
-#### Motivation
-
-Model 1's single Swin encoder had to simultaneously handle global context (where are the duplicate regions?) and local texture (what are the exact boundaries?). Disentangling these two tasks into dedicated encoders — one for similarity, one for localization — was the core hypothesis here.
-
-#### Architecture
+**The problem**: different modalities have completely different low-level features (HU ranges, vessel contrast, noise patterns), but aneurysm morphology is consistent across them. The solution is modality-specific CNN stems feeding into a single shared Swin Transformer body.
 
 ```
-Input (3, 224, 224)  Input (3, 448, 448)
-        │                     │
-        ▼                     ▼
-  Swin-Small            ConvNeXt-Small
-  Encoder               Encoder
-  (global context,      (local texture,
-   similarity)          boundary detail)
-        │                     │
-        └──────┬───────────────┘
-               ▼
-         FusionBlock
-         (BN → Concat → Conv 1×1 → 2/3 channel reduction)
-               │
-        ┌──────┴──────────────┐
-        ▼                     ▼
-   Auxiliary Heads        UNet Decoder
-   ├── Swin: Contrastive  (512→256→128→64→32)
-   │         embedding         │
-   └── ConvNeXt: Coarse        ▼
-       segmentation      Segmentation Head +
-                         Active Channel Head
+Input: 96×96×96 single-channel patch
+             │
+             ▼
+┌────────────────────────────────────┐
+│    Modality-Specific CNN Stem      │  Pretrained weights from MONAI Model Zoo:
+│                                    │
+│  CTA  → SegResNet first 4 layers   │  wholeBody_ct_segmentation
+│  MRA  → (same as CTA)              │
+│  T1c  → BraTS T1c channel slice    │  brats_mri_segmentation (channel 1)
+│  T2w  → BraTS T2w channel slice    │  brats_mri_segmentation (channel 2)
+│         + 1×1×1 conv proj → 128ch  │
+│  Output: 128 channels              │
+└─────────────────┬──────────────────┘
+                  │
+        Linear Bridge: 128 → 768
+        GELU + Dropout(0.3)
+                  │
+                  ▼
+┌────────────────────────────────────┐
+│    SwinUNETR Transformer Body      │  Pretrained: swin_unetr_btcv_segmentation
+│    Shared across all modalities    │
+│    4 Swin layers → Global AvgPool  │
+│    Output: 768-dim vector          │
+└───────────────┬────────────────────┘
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+ Aneurysm Head       Artery Head
+ LayerNorm           LayerNorm
+ 768 → 384 → 1       768 → 384 → 13
+ (binary logit)      (multi-label logits)
 ```
 
-**Key design decisions:**
+The MRI stems extract a single relevant input channel from BraTS pretrained weights (channel 1 for T1c, channel 2 for T2w), then project the 32-channel output to 128 via a 1×1×1 conv — enabling partial weight reuse from a 4-channel segmentation model.
 
-- **CoordConv:** Coordinate channels (normalized x, y) are concatenated to the input before the ConvNeXt branch. This gives the model explicit spatial awareness — critical for detecting that *two identical patches appear at different spatial coordinates*.
-- **FusionBlock:** Rather than naively concatenating encoder features, the fusion block first normalizes each independently (removing scale differences between architectures), concatenates, then reduces to 2/3 of the combined channels via a learned 1×1 convolution.
-- **Auxiliary heads:** The Swin branch drives contrastive learning (find similar patches); the ConvNeXt branch drives coarse segmentation (find any forged region). This division of labor allows loss gradients to specifically train each encoder for its intended function.
+### Phase 2 — Embedding Extraction
 
-#### Training Config
+After Phase 1 training, a stripped version `HybridAneurysmEmbedder` removes both classification heads and returns the **768-dim global average pool** of the SwinUNETR output for every patch. Run across 2 GPUs via `DataParallel`.
+
+- **319,550 patches** processed → `extracted_embeddings.hdf5`
+- Extraction runtime: ~68 minutes on 2× T4 GPUs
+- Output: 768-dim embedding per patch, plus coordinates in `embeddings_manifest.csv`
+
+### Phase 3 — Scan-Level Hierarchical Transformer
+
+The scan-level model performs two-stage spatial aggregation over all patch embeddings for a given scan:
+
+```
+Per-patch embeddings (768-dim) for all N patches in a scan
+             │
+             ▼
+┌────────────────────────────────────┐
+│    Local Transformer Stage         │
+│    Depth=2, Heads=6, MLP dim=768   │
+│    Patches grouped into spatial    │
+│    blocks (128×128×128 voxel region│
+│    + Sinusoidal positional embed   │
+│    + learnable CLS token per block │
+│    → One 768-dim CLS per block     │
+└─────────────────┬──────────────────┘
+                  │
+                  ▼
+┌────────────────────────────────────┐
+│    Global Transformer Stage        │
+│    Depth=4, Heads=6, MLP dim=768   │
+│    All block CLS tokens as input   │
+│    + Sinusoidal positional embed   │
+│    → Scan-level 768-dim vector     │
+└───────────────┬────────────────────┘
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+ Aneurysm Head       Artery Head
+ LayerNorm           LayerNorm
+ 768 → 384 → 1       768 → 384 → 13
+```
+
+Sinusoidal (non-learnable) positional embeddings with max length 256 make the model robust to variable numbers of patches across scans of different sizes. Training begins with a 1-epoch **alignment phase** (frozen backbone, eval mode) before full fine-tuning — post-alignment baseline was **0.4742**.
+
+---
+
+## Loss Function
+
+### Phase 1 — Hierarchical Focal Loss
+
+Custom `HierarchicalAneurysmLoss` handles class imbalance and the hierarchical dependency between tasks:
+
+```
+Total Loss = W_aneurysm × FocalLoss(aneurysm_logits, aneurysm_labels)
+           + W_artery   × BCE(artery_logits[positive_mask], artery_labels[positive_mask])
+```
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `W_aneurysm` | 5.0 | Detection is the primary task |
+| `W_artery` | 1.0 | Localization is conditional/secondary |
+| Focal α | 0.25 | Positive/negative class weight |
+| Focal γ | 2.0 | Down-weights easy negatives |
+| Artery loss fn | BCE (not Focal) | Supports soft label treatment for anatomically similar locations |
+
+Artery location loss is only computed on positive-mask samples — no gradient flows to the artery head from negative patches, enforcing the medical prior that location is undefined without presence.
+
+### Phase 3 — AUCMLoss
+
+The scan-level model uses `AUCMLoss` (from `libauc`) for both aneurysm and artery tasks, directly optimizing the AUC metric rather than a proxy, which is better suited to the severe class imbalance at scan level.
+
+---
+
+## Training Strategy
+
+### Hardware
+
+- Kaggle notebooks, **2× NVIDIA T4 GPUs**
+- Phase 1: **Distributed Data Parallel** via `torch.distributed` + NCCL
+- Phase 2 extraction: `torch.nn.DataParallel`
+- **Mixed precision** (`torch.cuda.amp`) throughout
+- Training across **multiple Kaggle sessions** with checkpoint resumption
+
+### Phase 1 — Patch-Level
 
 | Parameter | Value |
-|---|---|
-| Swin input | 224 × 224 |
-| ConvNeXt input | 448 × 448 |
-| Epochs | 50 (with early stopping, patience=5) |
-| Batch size | 17 |
-| Optimizer | AdamW (lr=5e-4) |
-| Loss weights | Swin contrastive: 2.0, ConvNeXt coarse: 0.8, Dice: 2.0 |
+|-----------|-------|
+| Batch size | 10 per GPU |
+| Gradient accumulation | 2 steps (effective batch: 40) |
+| Phase 1 LR | 1e-3 |
+| Phase 2 LR | 5e-5 |
+| Scheduler | CosineAnnealingLR |
+| Early stopping patience | 15 epochs |
+| Dropout | 0.3 |
+| Dynamic negative sampling | 30:1 (negatives : positives per epoch) |
 
-<!-- INSERT: Model 2 training curves — per-head loss breakdown, validation OF1 -->
+**Dynamic Undersampling**: each epoch draws a fresh random subset of negatives at a 30:1 ratio. Every positive patch is always seen; negatives are rotated across sessions to prevent memorization of specific negative patches.
 
----
+**GPU Augmentations (MONAI):** random flips (all 3 axes), random 90° rotations, random small-angle rotations (±25°), random intensity scaling, random gamma contrast adjustment.
 
-### Model 3 — DINOv2 + MLP + HDBSCAN Clustering
+### Phase 3 — Scan-Level
 
-**File:** `sci-forge-b-fins.ipynb`
-
-#### Motivation
-
-Models 1 and 2 treated mask prediction as a *supervised segmentation* task. But the fundamental nature of copy-move forgery is *self-similarity* — the forged region matches a source region. This calls for an *unsupervised clustering* approach: produce high-quality patch embeddings, then cluster them, and identify which clusters are duplicates.
-
-DINOv2 was chosen because its self-supervised pre-training already produces semantically rich, spatially coherent patch-level features — ideal for a clustering-based approach.
-
-#### Architecture
-
-```
-Input (3, 462, 462)
-      │
-      ▼
-DINOv2 ViT-B/14
-(462/14 = 33 patches per side → 33×33 patch grid)
-      │
-      ▼
- Patch tokens: (B, 1089, 768)
-      │
-      ▼
-MLP Projection Head
-  fc1: 768 → 1024 (LayerNorm + ReLU)
-  fc2: 1024 → 768 (LayerNorm + ReLU)
-  fc3: 768 → 512
-  L2-normalize → (B, 1089, 512)
-      │
-      ▼
-Reshape → (B, 33, 33, 512) embeddings
-      │
-   ┌──┴──── TRAINING ─────┐         ┌── INFERENCE ──────────────┐
-   │                      │         │                           │
-   ▼                      │         ▼                           │
-Uniformity Loss            │     HDBSCAN Clustering              │
-(low variance per instance)│     on (33×33, 512) embeddings      │
-Separation Loss            │         │                           │
-(high cosine distance      │     Cluster Validation              │
- between instances)        │     (cosine dist from bg centroid)  │
-Triplet Loss               │         │                           │
-(hard mining)              │     Mask Upsampling (33×33 → 462)   │
-   └──────────────────────┘     └──────────────────────────────┘
-```
-
-**Key design decisions:**
-
-- **Input size 462px:** Chosen so that `462 / 14 = 33` — a whole number of patches. This avoids partial patches at image boundaries that confuse the transformer attention pattern.
-- **HDBSCAN inference:** Rather than a fixed-threshold decoder, HDBSCAN discovers the natural cluster structure of the patch embeddings without requiring the number of clusters in advance. This is important because the number of forged instances varies per image.
-- **Cluster validation:** Not every HDBSCAN cluster corresponds to a forgery. A validation step computes the cosine distance between each candidate cluster's centroid and the background cluster's centroid. Only sufficiently distant clusters are promoted to mask predictions, filtering out clusters driven by genuine texture variation rather than duplication.
-- **Fine-tuning strategy:** After initial training on the synthetic dataset, the model is fine-tuned on a mixture of 100% competition test images + 6× augmented HQ images + 30% synthetic data. DINOv2 and MLP are both unfrozen at extremely low learning rate (1e-6) to prevent forgetting the pre-trained representations.
-
-#### Encoder Freeze Schedule
-
-| Phase | DINOv2 | MLP |
-|---|---|---|
-| Epochs 1–10 | ❄️ Frozen | 🔥 Training (lr=1e-3) |
-| Epochs 11–40 | 🔥 Fine-tuning (lr=1e-5) | 🔥 Training (lr=1e-3) |
-| Fine-tune phase | 🔥 (lr=1e-6) | 🔥 (lr=1e-6) |
-
-<!-- INSERT: Model 3 training curves — uniformity loss, separation loss, HDBSCAN parameter search -->
-
----
-
-## Loss Functions
-
-### Segmentation Losses (Models 1 & 2)
-
-**Dice Loss:** Directly optimizes region overlap. Critical for small forgery regions that BCE would otherwise ignore.
-
-$$\mathcal{L}_{Dice} = 1 - \frac{2 \cdot |P \cap G| + \varepsilon}{|P| + |G| + \varepsilon}$$
-
-**Segmentation Focal Loss:** Addresses foreground-background imbalance (typical forgery covers ~8% of image pixels).
-
-$$\mathcal{L}_{Focal} = -\alpha (1-p_t)^\gamma \log(p_t)$$
-
-with α=0.9, γ=2.0
-
-**Active Channel Loss:** Binary focal loss on the instance-presence prediction head, preventing empty channels from generating false positive masks.
-
-### Contrastive Loss (Models 1 & 2)
-
-For each image in a batch, pixels are sampled from:
-- Background: up to 256 samples
-- Each active forgery instance: up to 64 samples per instance
-
-A margin-based contrastive loss is applied:
-- **Background–Foreground margin:** 1.5 (push forgery pixels away from background)
-- **Foreground–Foreground margin:** 1.0 (push pixels of *different* instances away from each other)
-
-```
-Loss_contrastive = w_bg_fg * max(0, margin_bg_fg - dist(bg, fg))
-                 + w_fg_fg * max(0, margin_fg_fg - dist(fg_i, fg_j))
-```
-
-### Embedding Losses (Model 3)
-
-**Uniformity Loss:** Penalizes high intra-instance variance. Only activated when variance exceeds threshold (0.1), allowing the model to focus on separation rather than collapse.
-
-**Separation Loss:** Maximizes cosine distance between centroids of different instances (background + forgeries). Weight 2.5× — prioritized over uniformity.
-
-**Triplet Loss (hard mining):** Anchors from one instance, positives from the same instance, negatives from another instance — selected as the *hardest* (closest) negative to maximize margin efficiency.
-
----
-
-## Training Infrastructure
-
-All models were trained with **PyTorch DistributedDataParallel (DDP)** across 2 T4 GPUs.
-
-```python
-# DDP launch pattern used across all notebooks
-mp.spawn(train_ddp, args=(world_size,), nprocs=world_size, join=True)
-```
-
-**Shared infrastructure across all models:**
-
-| Component | Implementation |
-|---|---|
-| Multi-GPU training | PyTorch DDP (NCCL backend) |
-| Mixed precision | `torch.cuda.amp` (GradScaler + autocast) |
-| Gradient accumulation | 2–10 steps depending on model |
-| Letterbox resizing | Aspect-ratio-preserving padding |
-| Data augmentation | Albumentations (flip, rotate, color jitter, Gaussian blur, JPEG compression) |
-| Checkpointing | Best + current checkpoints, saved per epoch |
-| Threshold tuning | Grid search on active-channel threshold × mask threshold, evaluated on 15% of training data |
-| Validation | Sampled validation (20–50% of val set) with 30/70 authentic/forged ratio |
-
-**Evaluation metric — OF1:**
-
-The Object F1 score uses the Hungarian algorithm (linear sum assignment) to optimally match predicted masks to ground truth masks, then computes F1 based on the best-matched pairs. Authentic images contribute score=1.0 if no masks are predicted, 0.0 otherwise. The final score is the average across all images.
-
-```python
-# Simplified OF1 logic
-from scipy.optimize import linear_sum_assignment
-
-cost_matrix = compute_iou_matrix(pred_masks, gt_masks)
-row_ind, col_ind = linear_sum_assignment(-cost_matrix)
-matched_ious = cost_matrix[row_ind, col_ind]
-```
+| Parameter | Value |
+|-----------|-------|
+| Train / Test scans | 3,456 / 864 |
+| Batch size | 120 embeddings |
+| Max epochs | 100 |
+| Fine-tuning LR | 5e-6 |
+| Early stopping patience | 6 epochs |
+| Dropout | 0.2 |
 
 ---
 
 ## Results
 
-| Model | Architecture | Best Val OF1 |
-|---|---|---|
-| Model 1 | Hybrid CNN Stem + Swin-Small + UNet + Contrastive | — |
-| Model 2 | Dual Encoder (Swin + ConvNeXt) + Fusion + Auxiliary Heads | — |
-| Model 3 | DINOv2 ViT-B/14 + MLP + HDBSCAN Clustering | **0.3727** |
+### Phase 1 — Patch-Level Model (64,784 test patches)
 
-> **Note on scores:** An OF1 of ~0.37 is substantially harder to achieve than it looks. The metric requires the model to precisely identify the *forged region* (not just "something is wrong here") at the instance level, with matching penalized by the Hungarian algorithm. Perfect localization of the background — the dominant class — contributes nothing; only correct, tightly-bounded forgery masks score points. Additionally, the source region (where the copy came from) must also be found and masked — the model effectively needs to identify two visually identical regions and flag both.
+| Metric | Value |
+|--------|-------|
+| **Aneurysm Present — ROC AUC** | **0.9107** |
+| Aneurysm Present — PR AUC | 0.2495 |
+| Artery Location — ROC AUC (Micro) | 0.7630 |
 
-<!-- INSERT: Final per-model OF1 comparison bar chart -->
+> The low patch-level PR AUC reflects extreme class imbalance — the vast majority of patches contain no aneurysm. ROC AUC is the more meaningful patch-level metric.
 
-<!-- INSERT: Qualitative predictions — best / average / worst cases (image | ground truth | prediction overlay) -->
+---
 
-<!-- INSERT: Training curves for best model (Model 3) — loss, separation, uniformity, LR -->
+### Phase 3 — Scan-Level Model (864 test scans)
+
+| Metric | Value |
+|--------|-------|
+| **Aneurysm Present — ROC AUC** | **0.8540** |
+| **Aneurysm Present — PR AUC** | **0.8221** |
+| Mean Artery Location — ROC AUC | 0.6109 |
+| **Final Combined Score** | **0.7325** |
+
+**Aneurysm detection at 0.5 threshold:** Precision 0.92 · Recall 0.50 · F1 0.65 (320 positive scans in test set)
+
+> The scan-level model shows a large improvement in PR AUC (0.25 → 0.82) by aggregating global context across the full volume. The 0.92 precision at 0.5 threshold indicates that when the model predicts positive, it is very likely correct. Recall can be improved with threshold tuning. Artery localization (mean AUC 0.61) is the harder sub-task, inherently dependent on the detection step being correct first.
+
+---
+
+### Visualizations
+
+<!-- Add training history plot here: visualizations/training_history.png -->
+**Training Loss & Score Curves**
+
+<!-- Add ROC and PR curves here: visualizations/roc_pr_curves.png -->
+**ROC and Precision-Recall Curves**
+
+<!-- Add confusion matrix here: visualizations/confusion_matrix_and_distribution.png -->
+**Confusion Matrix & Score Distribution**
 
 ---
 
 ## Repository Structure
 
 ```
-sci-forge/
-├── sci-forge-b.ipynb               # Model 1: Hybrid Swin+UNet
-│   ├── config.py                   # Hyperparameters & paths
-│   ├── model.py                    # ConvStem + Swin + UNet + Contrastive head
-│   ├── dataset.py                  # ForgeryDataset (letterbox, multi-instance masks)
-│   ├── losses.py                   # Dice + SegFocal + Contrastive + Active focal
-│   ├── train.py                    # DDP training loop
-│   ├── threshold.py                # Grid search over active/mask thresholds
-│   ├── test.py                     # Evaluation + visualization
-│   └── utils.py                    # RLE encode/decode, OF1 metric
+Aneurysm_detection/
 │
-├── sci-forge-b-tri.ipynb           # Model 2: Dual-Encoder Fusion
-│   ├── config.py
-│   ├── model.py                    # CoordConv + Swin + ConvNeXt + FusionBlock + UNet
-│   ├── dataset.py                  # Dual-resolution loader (224 + 448)
-│   ├── losses.py                   # Dice + Focal + Contrastive + Coarse seg
-│   ├── train.py                    # DDP training + early stopping
-│   ├── threshold.py
-│   └── test.py
+├── preprocess_ct.py                   # CTA preprocessing pipeline
+├── prep_mr.py                         # MRA / MRI preprocessing pipeline
+├── save_cta.py                        # Parallel CTA processing → HDF5
+├── save_mr.py                         # Parallel MRA processing → HDF5
+├── save_all.py                        # Unified pipeline (all modalities)
 │
-├── sci-forge-b-fins.ipynb          # Model 3: DINOv2 + HDBSCAN
-│   ├── config.py
-│   ├── model.py                    # DINOv2 ViT-B/14 + 3-layer MLP projection
-│   ├── dataset.py                  # 462px letterbox loader, 33×33 mask downsampling
-│   ├── losses.py                   # Uniformity + Separation + Triplet
-│   ├── clustering.py               # HDBSCAN + candidate validation
-│   ├── train.py                    # DDP training loop
-│   ├── tuning.py                   # HDBSCAN hyperparameter search (parallel CPU)
-│   ├── finetune_config.py          # Fine-tuning config (mixed dataset)
-│   ├── finetune_dataset.py         # RepeatedDataset + SubsampledDataset
-│   ├── finetune_train.py           # Fine-tuning script
-│   ├── extract_embeddings.py       # GPU embedding extraction → CPU HDBSCAN tuning
-│   └── test.py
+├── patching.py                        # Patch manifest creation (NPY backend)
+├── patching_hdf5.py                   # Patch manifest creation (HDF5 backend)
+├── nii_to_npy.py                      # NIfTI to NumPy conversion utility
 │
-├── sci-forge-dataset-generation.ipynb  # SAM3 synthetic data generation
-│   └── generate_final.py           # Multi-GPU generation pipeline
+├── training-aneurysm-kaggle.ipynb     # Phase 1: Patch-level DDP training
+├── model-data-collection-patch.ipynb  # Phase 2: Embedding extraction
+├── scan-level-model-rsna.ipynb        # Phase 3: Scan-level training
 │
-├── rle_convert.py                  # RLE string → raw (N, H, W) mask converter
-├── test.ipynb                      # Dataset visualization & mask verification
-└── test2.ipynb                     # Grid visualization, checkpoint inspection
+├── mra.ipynb                          # MRA data exploration
+├── train_data.ipynb                   # Training data analysis
+├── test.ipynb                         # Evaluation / inference notebook
+│
+├── view3d_data.py                     # Interactive 3D volume viewer with crosshairs
+├── verify_hdf5.py                     # HDF5 integrity check + slice export
+├── savee_2d_images.py                 # 2D slice export for visual inspection
+│
+├── clustering/                        # Data exploration & clustering notebooks
+├── models/                            # Saved model checkpoints
+│
+├── processed_data_unified/
+│   ├── localization_manifest.csv      # 3D coordinates + labels for all scans
+│   └── preprocessing_log.csv          # Per-scan processing status
+│
+└── aneurysm_dataset_manifests_hdf5_ho/
+    ├── train_manifest.csv             # Patch-level training set
+    └── test_manifest.csv              # Patch-level test set
 ```
 
 ---
@@ -452,75 +411,79 @@ sci-forge/
 ### Requirements
 
 ```bash
-pip install torch torchvision timm albumentations \
-            hdbscan numba scipy scikit-learn \
-            opencv-python Pillow tqdm
+pip install torch torchvision monai[all] h5py SimpleITK pydicom \
+            numpy pandas scikit-learn scipy tqdm libauc matplotlib seaborn
 ```
 
-For synthetic data generation:
+### Step 1 — Preprocess Scans
 
 ```bash
-git clone https://github.com/facebookresearch/sam3.git
-cd sam3 && pip install -e .
-pip install --force-reinstall numpy==1.26.4 numba
+python save_all.py
 ```
 
-### Training (Model 3 — DINOv2)
+Configure paths at the top of `save_all.py`: `BASE_PATH` (raw DICOMs), `ORIGINAL_LOCALIZATION_CSV`, `OUTPUT_DIR`.
 
-Update paths in `sci-forge-b-fins/config.py`, then:
+### Step 2 — Generate Patch Manifests
 
 ```bash
-# Initial training
-python train.py
-
-# HDBSCAN parameter search
-python tuning.py
-
-# Fine-tuning on mixed dataset
-python finetune_train.py
-
-# Evaluation
-python test.py
+python patching_hdf5.py
 ```
 
-### Converting Masks
+Key settings: `PATCH_SIZE=96`, `STRIDE=64`, `TRAIN_SIZE=0.8`, `HDF5_DATA_PATH`.
 
-```bash
-python rle_convert.py
-# Reads from: synthetic_forgery_dataset/masks/
-# Writes to:  synthetic_forgery_dataset/masks_converted/
-```
+### Step 3 — Phase 1: Train Patch-Level Model
 
-### Synthetic Data Generation
+Open `training-aneurysm-kaggle.ipynb` on Kaggle (2× T4 recommended). Requires MONAI Model Zoo pretrained weights for `wholeBody_ct_segmentation`, `swin_unetr_btcv_segmentation`, and `brats_mri_segmentation`.
 
-Edit `START_INDEX` and `END_INDEX` in `generate_final.py` for batch processing, then:
+### Step 4 — Phase 2: Extract Embeddings
 
-```bash
-python generate_final.py
+Open `model-data-collection-patch.ipynb` on Kaggle. Loads the best Phase 1 checkpoint and extracts 768-dim embeddings for all 319,550 patches into `extracted_embeddings.hdf5`.
+
+### Step 5 — Phase 3: Train Scan-Level Model
+
+Open `scan-level-model-rsna.ipynb` on Kaggle. Trains `HierarchicalTransformer` over 3,456 training scans using the extracted embeddings.
+
+### Visualize a Scan
+
+```python
+from view3d_data import view_3d_volume
+import h5py, numpy as np
+
+with h5py.File("processed_data_unified/processed_scans.hdf5", "r") as f:
+    volume = f["<series_uid>"][()].astype(np.float32)
+
+# Pass known aneurysm coordinates as (z, y, x) tuples to see crosshair views
+view_3d_volume(volume, crosshair_coords=[(42, 128, 96)])
 ```
 
 ---
 
-## Key Takeaways
+## Technologies Used
 
-**What worked:**
-
-- Contrastive / embedding-based learning consistently outperformed pure segmentation approaches for this task. The self-similarity structure of copy-move forgery is naturally suited to metric learning.
-- DINOv2's self-supervised pre-training provided extremely strong patch representations out of the box, requiring only a lightweight MLP projection to be useful for this domain.
-- HDBSCAN's density-based clustering handled variable instance counts without needing a fixed "number of objects" — a significant practical advantage over K-means-style approaches.
-- Synthetic data from SAM3 at scale (~85k COCO-derived images) gave the model exposure to diverse patch-copy scenarios beyond the domain-specific training set.
-
-**What was challenging:**
-
-- Scientific images' homogeneous backgrounds caused both high false positive rates (background patches incorrectly clustered as forgeries) and low recall (forged regions with subtle boundaries getting absorbed into the background cluster).
-- The OF1 metric penalizes imprecise mask boundaries heavily — models that correctly *detected* forgeries but produced oversized or shifted masks still scored poorly.
-- The source region (the patch that was *copied from*) is as important to detect as the destination region, but has no visual anomaly on its own — requiring the model to compare across the entire image rather than making local predictions.
-
-**If given more time:**
-
-- Correlation-map based approaches (comparing patch embeddings pairwise across the full image to find duplicate pairs) would be the natural next step
-- Ensemble of Models 1 and 3 (segmentation backbone + embedding backbone) for better boundary precision
+| Category | Tools |
+|----------|-------|
+| Deep Learning | PyTorch 2.6, MONAI, SwinUNETR, SegResNet |
+| Medical Imaging | SimpleITK, pydicom |
+| Data Processing | NumPy, Pandas, SciPy, HDF5 (h5py) |
+| Training | DDP (`torch.distributed`), AMP (`torch.cuda.amp`), libauc (AUCMLoss) |
+| Visualization | Matplotlib, Seaborn, ipywidgets |
+| Infrastructure | Kaggle (2× T4), `multiprocessing.Pool`, file-lock concurrency |
 
 ---
 
-*Built with PyTorch, timm, DINOv2, SAM3, HDBSCAN, and Albumentations.*
+## Key Engineering Highlights
+
+- **Multi-modal transfer learning via channel slicing**: extracted single-channel slices from a 4-channel BraTS pretrained model to initialize MRI stems, reusing learned feature representations without retraining from scratch.
+- **Three-stage decoupled pipeline**: patch classification → embedding extraction → scan-level aggregation, each stage producing artifacts consumed by the next, coordinated across multiple Kaggle sessions via checkpointing.
+- **End-to-end DICOM coordinate pipeline**: 2D pixel annotation → physical 3D point → resampled voxel coordinate, handling single-frame and multiframe DICOMs, `PerFrameFunctionalGroupsSequence`, and varying `ImagePositionPatient` origins across manufacturers.
+- **Memory-efficient on-the-fly HDF5 patching**: float16 + chunked gzip storage with patch extraction at training time, enabling training on a dataset too large to fit in RAM.
+- **Atomic file-lock for parallel HDF5 writes**: `os.O_CREAT | os.O_EXCL` provides kernel-level atomic lock acquisition, preventing race conditions across 8 concurrent workers without a shared memory manager.
+- **Hierarchical conditional loss**: artery location loss backpropagates only through positive-mask samples, enforcing the medical prior that location is meaningless without presence.
+
+---
+
+## Acknowledgements
+
+- [RSNA](https://www.rsna.org/) and [Kaggle](https://www.kaggle.com/) for the competition and dataset
+- [MONAI](https://monai.io/) for pretrained medical imaging models (SegResNet, SwinUNETR, BraTS)
+- [libauc](https://libauc.org/) for AUC-optimized loss functions
