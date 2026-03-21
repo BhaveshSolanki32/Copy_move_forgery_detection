@@ -60,15 +60,20 @@ The original dataset contains **5,128 RGB scientific images**:
 | Mask files (`.npy`, one per forged image) | 2,751 |
 | Images with both authentic and forged versions | 2,377 |
 
+Sample of data:
+<img width="594" height="2379" alt="6637b030-6a04-434b-8be3-b124cc144246" src="https://github.com/user-attachments/assets/4d28f853-58b9-4fb9-8b23-f0608db5ce3c" />
+
+
 A key structural observation: 2,377 filenames appear in *both* the authentic and forged folders — meaning these images have a clean original and a manipulated version with the same name, forming a paired structure.
 
 **Mask format:** All masks are stored as `(N, H, W)` NumPy arrays where N is the number of forged instances (confirmed across all 2,751 masks). Instance labels range 1–5 (max 5 instances per image in the ground truth).
 
 **Instance counts per image** (range: 1–5):
 
-Total instances across all 2,751 masks: **3,823** (average ≈ 1.39 instances per forged image).
+Total instances across all 2,751 masks: **3,823**.
 
-<!-- INSERT: Bar chart — instance count distribution (x: 1 to 5, y: number of images) -->
+<img width="704" height="547" alt="d83ef5dd-f611-44a8-8b94-c61b2114aff8" src="https://github.com/user-attachments/assets/edc58f34-a571-4b9e-ad7a-5c8bb4ba605b" />
+
 
 **Forgery area coverage** (per instance, as fraction of total image area):
 
@@ -96,7 +101,9 @@ Top 5 most common sizes: 1000×666 (686 images), 256×256 (605), 1600×1200 (530
 
 763 unique dimension combinations made fixed-resolution training impossible — letterbox resizing was required throughout. EDA also explored mask-to-YOLO polygon format conversion and visualised authentic/forged pairs side-by-side with mask contour overlays.
 
-<!-- INSERT: EDA visualisations — instance count bar chart, area ratio histogram with KDE, 2D image dimension heatmap, sample authentic/forged/mask overlay grid -->
+<img width="838" height="701" alt="e971ea1c-226b-43a3-bfd5-e9cf7553a2b5" src="https://github.com/user-attachments/assets/ba470fa0-bf92-475a-ad6d-0d39947060c3" />
+
+<img width="859" height="547" alt="482a1766-dbaf-4fa4-9977-1d2ddb6301d3" src="https://github.com/user-attachments/assets/be55111d-a3f8-41d6-816a-5eaa22a0b0bb" />
 
 ---
 
@@ -137,9 +144,20 @@ Multi-GPU DDP was used across both T4s during generation to parallelise SAM3 inf
 | Dataset | Source | Forged Images | Authentic Images |
 |---|---|---|---|
 | Scientific domain | Scientific paper images | ~11,000 | ~13,000 |
-| COCO-derived | COCO 2017 | ~84,700 | — |
+| COCO-derived | COCO 2017 | ~84,700 | 0 |
 
-<!-- INSERT: Sample generated images — original / forged image / mask overlay -->
+#### Samples of Generated Data Scientific domain:
+<img width="1589" height="576" alt="download" src="https://github.com/user-attachments/assets/62cd20e1-e76a-497e-9933-6b4fea41f85b" />
+<img width="1589" height="533" alt="download" src="https://github.com/user-attachments/assets/8542b571-b287-4ac1-8f5a-db0ff54be9d8" />
+<img width="1589" height="576" alt="download" src="https://github.com/user-attachments/assets/4ca41094-27a5-4d1c-97ab-0d6547121b31" />
+
+#### Samples of COCO Generated Data: 
+<img width="1790" height="389" alt="download" src="https://github.com/user-attachments/assets/5e279282-aff3-47df-87d1-58b30ff403ee" />
+<img width="640" height="480" alt="test2017_000000000063" src="https://github.com/user-attachments/assets/833112e7-38e4-48a1-8e99-257611ebe0e9" />
+<img width="490" height="640" alt="test2017_000000000128" src="https://github.com/user-attachments/assets/cbafc3fc-2742-4aee-9c8b-942042a247fa" />
+<img width="640" height="427" alt="test2017_000000000448" src="https://github.com/user-attachments/assets/fcca5715-98d8-4563-b1eb-7fd295d28948" />
+
+
 
 ### Mask Conversion
 
@@ -161,6 +179,7 @@ All three models share the same core hypothesis: **learn discriminative dense em
 ### Model 1 — Hybrid Stem Swin+UNet with Contrastive Learning
 
 **File:** `sci-forge-b.ipynb`
+**Kaggle notebook:** `https://www.kaggle.com/code/bhaveshsolanki001/sci-forge-b`
 
 #### Architecture
 
@@ -203,17 +222,18 @@ UNet Decoder  (ConvTranspose2d + skip connections)
 | Optimizer | AdamW (lr=4e-4, wd=1e-4) |
 | Scheduler | CosineAnnealing (η_min=1e-6) |
 | Mixed precision | AMP |
-| Encoder freeze | First 1 epoch |
+| Encoder freeze | First 10 epoch |
 | Contrastive temperature | 0.07 |
 | BG samples / instance samples | 256 / 64 |
 
-<!-- INSERT: Model 1 training curves — component losses, validation OF1 vs epoch, LR schedule -->
+<img width="2382" height="1780" alt="__results___11_1" src="https://github.com/user-attachments/assets/5372dd86-c22b-42cd-9b12-8b7a61707061" />
 
 ---
 
 ### Model 2 — Dual-Encoder Swin + ConvNeXt Fusion
 
 **File:** `sci-forge-b-tri.ipynb`
+**Kaggle Notebook:** `https://www.kaggle.com/code/bhaveshsolanki2168/sci-forge-b-tri?scriptVersionId=291288405`
 
 #### Motivation
 
@@ -261,13 +281,15 @@ Input (3, 224, 224)          Input (3, 448, 448)
 | Loss weights | Dice: 2.0, Swin contrastive: 2.0, ConvNeXt coarse: 0.8, Active focal: 4.0 |
 | Encoder freeze | First 10 epochs |
 
-<!-- INSERT: Model 2 training curves — per-head loss breakdown, validation OF1 -->
+<img width="2382" height="2680" alt="training_curves" src="https://github.com/user-attachments/assets/c7ef9952-3f36-48b2-adf2-a86d559269c2" />
+
 
 ---
 
 ### Model 3 — DINOv2 + MLP + HDBSCAN Clustering
 
 **File:** `sci-forge-b-fins.ipynb`
+**Kaggle notebook:** `https://www.kaggle.com/code/bhaveshsolanki32/sci-forge-b-fins/notebook`
 
 #### Motivation
 
@@ -320,7 +342,6 @@ Reshape → (B, 33, 33, 512) patch embeddings
 | Epochs 11–40 | Fine-tuning (lr=1e-5) | 1e-3 |
 | Fine-tune phase (30 epochs) | Fine-tuning (lr=1e-6) | 1e-6 |
 
-<!-- INSERT: Model 3 training curves — uniformity loss, separation loss, LR schedule, HDBSCAN parameter search heatmap -->
 
 ---
 
@@ -388,15 +409,13 @@ row_ind, col_ind = linear_sum_assignment(-cost_matrix)  # Hungarian matching
 
 | Model | Architecture | Best Val OF1 |
 |---|---|---|
-| Model 1 | Hybrid CNN Stem + Swin-Small + UNet + Contrastive | — |
-| Model 2 | Dual Encoder (Swin + ConvNeXt) + Fusion + Auxiliary Heads | — |
-| Model 3 | DINOv2 ViT-B/14 + MLP + HDBSCAN | **0.3727** (epoch 39) |
+| Model 1 | Hybrid CNN Stem + Swin-Small + UNet + Contrastive | **0.3095** |
+| Model 2 | Dual Encoder (Swin + ConvNeXt) + Fusion + Auxiliary Heads | **0.4556** |
+| Model 3 | DINOv2 ViT-B/14 + MLP + HDBSCAN | **0.3971** |
 
-> **Note on OF1 scores:** An OF1 of ~0.37 on this task is harder to achieve than the number suggests. The metric requires precise instance-level mask predictions matched via the Hungarian algorithm — detecting a forgery is not enough, the mask boundary must be accurate. More importantly, the *source region* (the patch copied from) carries no visual anomaly yet must also be detected, requiring the model to compare patches across the entire image rather than making local predictions.
+> **Note on OF1 scores:** An OF1 of ~0.45 on this task is harder to achieve than the number suggests. The metric requires precise instance-level mask predictions matched via the Hungarian algorithm — detecting a forgery is not enough, the mask boundary must be accurate. More importantly, the *source region* (the patch copied from) carries no visual anomaly yet must also be detected, requiring the model to compare patches across the entire image rather than making local predictions.
 
-<!-- INSERT: OF1 bar chart comparing all three models -->
-
-<!-- INSERT: Qualitative predictions — best / median / worst cases (image | ground truth | prediction overlay) -->
+<img width="900" height="437" alt="download" src="https://github.com/user-attachments/assets/4b951da1-b7dd-461f-897b-33ab9bc2704b" />
 
 ---
 
