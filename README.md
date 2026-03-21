@@ -60,7 +60,7 @@ The original dataset contains **5,128 RGB scientific images**:
 | Mask files (`.npy`, one per forged image) | 2,751 |
 | Images with both authentic and forged versions | 2,377 |
 
-Sample of data:
+#### Sample of data:
 <img width="594" height="2379" alt="6637b030-6a04-434b-8be3-b124cc144246" src="https://github.com/user-attachments/assets/4d28f853-58b9-4fb9-8b23-f0608db5ce3c" />
 
 
